@@ -1,0 +1,19 @@
+apiVersion: nodes.example.com/v1alpha1
+kind: NodePool
+metadata:
+  name: gpu-pool
+spec:
+  image: ubuntu-22.04-gpu
+  labels:
+    workload: gpu
+    tier: premium
+  taints:
+    - key: nvidia.com/gpu
+      value: "true"
+      effect: NoSchedule
+  unreadyPolicy:
+    gracePeriod: 5m
+    action: Remove
+    maxConcurrentRemovals: 1
+    drainTimeout: 5m
+    forceDeletePodsAfterDrainTimeout: false

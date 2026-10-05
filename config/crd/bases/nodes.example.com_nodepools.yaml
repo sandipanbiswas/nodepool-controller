@@ -1,0 +1,245 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: nodepools.nodes.example.com
+spec:
+  group: nodes.example.com
+  names:
+    kind: NodePool
+    listKind: NodePoolList
+    plural: nodepools
+    shortNames:
+    - npool
+    singular: nodepool
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.readyNodes
+      name: ReadyNodes
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NodePool groups nodes that share OS image, labels, and taints.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: NodePoolSpec defines the desired state of NodePool.
+            properties:
+              image:
+                description: Image is informational for the infra layer; this controller
+                  does not provision VMs.
+                type: string
+              labels:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Labels applied to member nodes. Keys reserved by Kubernetes or used as the
+                  bootstrap label are ignored.
+                type: object
+              taints:
+                description: Taints applied to member nodes. System taints (node.kubernetes.io/*)
+                  are ignored.
+                items:
+                  description: Taint is a subset of corev1.Taint used in NodePool
+                    spec (no TimeAdded).
+                  properties:
+                    effect:
+                      enum:
+                      - NoSchedule
+                      - PreferNoSchedule
+                      - NoExecute
+                      type: string
+                    key:
+                      minLength: 1
+                      type: string
+                    value:
+                      type: string
+                  required:
+                  - effect
+                  - key
+                  type: object
+                type: array
+              unreadyPolicy:
+                description: 'UnreadyPolicy is required: callers must choose Remove,
+                  Cordon, or Ignore.'
+                properties:
+                  action:
+                    description: Action taken after gracePeriod. Required so we never
+                      silently delete nodes.
+                    enum:
+                    - Remove
+                    - Cordon
+                    - Ignore
+                    type: string
+                  drainTimeout:
+                    description: |-
+                      DrainTimeout is how long to wait for eviction (respecting PDBs) before giving up.
+                      Defaults to 5m in the controller if omitted.
+                    type: string
+                  forceDeletePodsAfterDrainTimeout:
+                    description: |-
+                      ForceDeletePodsAfterDrainTimeout, if true, grace-period-0 deletes remaining pods
+                      after DrainTimeout — but only when the Node Ready condition is Unknown (kubelet
+                      is likely gone). Default false: we delete the Node object and let pod GC finish.
+                    type: boolean
+                  gracePeriod:
+                    description: GracePeriod is how long a node may stay NotReady
+                      (Ready=False or Unknown) before action.
+                    type: string
+                  maxConcurrentRemovals:
+                    default: 1
+                    description: MaxConcurrentRemovals caps how many members may be
+                      in Draining or Removing at once.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                required:
+                - action
+                - gracePeriod
+                type: object
+            required:
+            - unreadyPolicy
+            type: object
+          status:
+            description: NodePoolStatus defines the observed state of NodePool.
+            properties:
+              conditions:
+                description: Conditions follow metav1.Condition (Ready, Progressing,
+                  Failed).
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              nodes:
+                description: Nodes is the per-member observed state.
+                items:
+                  description: NodeMemberStatus is the observed state of one member.
+                  properties:
+                    drainStartedAt:
+                      description: DrainStartedAt is when Draining began. Persisted
+                        so drain timeout survives restart.
+                      format: date-time
+                      type: string
+                    name:
+                      type: string
+                    notReadySince:
+                      description: |-
+                        NotReadySince is when this controller first observed NotReady for the current incident.
+                        Persisted so grace period survives process restart. Nil when Ready.
+                      format: date-time
+                      type: string
+                    phase:
+                      description: NodePhase is the controller's view of a member
+                        node.
+                      enum:
+                      - Ready
+                      - NotReady
+                      - Draining
+                      - Removing
+                      type: string
+                  required:
+                  - name
+                  - phase
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: ObservedGeneration is the spec generation last successfully
+                  reconciled.
+                format: int64
+                type: integer
+              readyNodes:
+                description: ReadyNodes is the count of members whose Node Ready condition
+                  is True.
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
