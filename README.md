@@ -31,6 +31,138 @@ Ready → NotReady (clock) → Draining (cordon + eviction API) → Removing (de
 
 `maxConcurrentRemovals` counts members in `Draining` or `Removing`. Reconciliation is **level-triggered**; the loop never `Sleep`s — it returns `RequeueAfter` for remaining grace or drain wait.
 
+## Sequence flows
+
+Watches enqueue the owning NodePool from a Node via the bootstrap label `nodes.example.com/nodepool` or the `claimed-by` annotation. Every path below is one or more level-triggered `Reconcile` calls.
+
+### 1. Node join
+
+Infra (or the demo) stamps the bootstrap label. The controller claims the node, applies owned labels/taints, and records Ready members.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Infra
+  participant API as API server
+  participant C as NodePool controller
+  participant NP as NodePool
+  participant N as Node
+
+  Infra->>API: create/label Node<br/>nodes.example.com/nodepool=gpu-pool
+  API->>C: Watch Node (map to pool)
+  C->>API: Get NodePool gpu-pool
+  C->>API: List members by bootstrap label
+  alt no finalizer yet
+    C->>API: Update NodePool + finalizer
+    C->>C: Requeue
+  end
+  C->>API: Update Node<br/>claimed-by, spec.labels, spec.taints,<br/>managed-* annotations
+  C->>API: Event NodeJoined
+  C->>API: Status: phase=Ready, readyNodes++, observedGeneration
+```
+
+### 2. Spec change (labels / taints)
+
+Owned keys in `managed-labels` / `managed-taints` are added or removed. Foreign keys (kubelet, humans, CCM) are left alone.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Op as Operator
+  participant API as API server
+  participant C as NodePool controller
+  participant N as Node
+
+  Op->>API: patch NodePool spec.labels / spec.taints
+  API->>C: Watch NodePool
+  C->>API: Get NodePool (new generation)
+  C->>API: List member Nodes
+  loop each member
+    C->>C: drop managed keys no longer in spec
+    C->>C: upsert spec keys (overwrite if owned)
+    C->>C: leave foreign labels/taints
+    C->>API: Update Node + rewrite managed annotations
+  end
+  C->>API: Status observedGeneration = metadata.generation
+```
+
+### 3. Reactive scale-down (`action: Remove`)
+
+Infra reclaims the VM; kubelet stops heartbeating. `node-lifecycle-controller` taints unreachable independently. After `gracePeriod`, this controller cordons, evicts (PDBs), then deletes the **Node** object — bounded by `maxConcurrentRemovals`.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Infra
+  participant Kubelet
+  participant NLC as node-lifecycle-controller
+  participant API as API server
+  participant C as NodePool controller
+  participant Pods
+
+  Infra->>Kubelet: reclaim VM / stop kubelet
+  Kubelet--xAPI: heartbeats stop
+  NLC->>API: Ready=Unknown / False<br/>taint unreachable:NoExecute
+  API->>C: Watch Node
+  C->>API: Get NodePool + member
+  C->>API: Status phase=NotReady, notReadySince
+  C->>API: Event NodeNotReady
+  C->>C: RequeueAfter remaining grace
+  Note over C: later reconcile, grace expired<br/>and inFlight < maxConcurrentRemovals
+  C->>API: Cordon (unschedulable + cordoned annotation)
+  C->>API: Event NodeDraining
+  C->>API: List pods on node
+  alt evictable pods remain and drain not timed out
+    C->>API: Create pods/eviction
+    alt PDB 429
+      API-->>C: TooManyRequests
+      C->>C: RequeueAfter 2s
+    else
+      API->>Pods: eviction accepted
+    end
+  else drain timeout and forceDeletePods=false
+    C->>API: Event DrainTimeout
+    Note over C: do not force-delete pods
+  end
+  C->>API: Event NodeRemoving
+  C->>API: Delete Node object
+  C->>API: Status phase=Removing
+  Note over C: next reconcile, Node NotFound
+  C->>API: Event NodeRemoved
+  C->>API: drop member from status
+```
+
+`Cordon` stops after unschedulable; `Ignore` only records NotReady.
+
+### 4. NodePool deletion
+
+Finalizer blocks removal until owned labels/taints are stripped. Nodes are **not** deleted — infra owns the VMs.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Op as Operator
+  participant API as API server
+  participant C as NodePool controller
+  participant N as Node
+  participant NP as NodePool
+
+  Op->>API: delete NodePool
+  API->>NP: deletionTimestamp set (finalizer holds)
+  API->>C: Watch NodePool
+  C->>API: List members
+  C->>API: Event PoolDeleting
+  loop each member
+    alt Ready
+      C->>N: uncordon if we cordoned
+    end
+    C->>N: strip managed labels/taints,<br/>claimed-by, cordoned annotation
+    Note over N: bootstrap label kept
+  end
+  C->>API: remove finalizer
+  API->>API: garbage-collect NodePool
+```
+
 ## Build & run locally
 
 Prerequisites: Go 1.26+, Docker, kubectl, [kind](https://kind.sigs.k8s.io/).
@@ -65,63 +197,129 @@ RBAC is generated from `+kubebuilder:rbac` markers (`config/rbac/role.yaml`): No
 
 CI: `.github/workflows/test.yml` runs `make test`. `.github/workflows/test-e2e.yml` builds the image, loads it into kind, deploys the manager, and runs `go test ./test/e2e/`.
 
-## Design decisions
+## Architecture decisions (pros / cons)
+
+Each decision below is written like an ADR: **context → choice → alternatives → trade-offs**. Sequence diagrams for the resulting flows are in [Sequence flows](#sequence-flows) above.
+
+### ADR-1 — Label/taint ownership: managed-key annotations (not SSA)
+
+**Context.** Spec changes must add/remove only keys this controller owns. Nodes are contended (kubelet, CCM, humans, CNI).
+
+**Decision.** Persist owned keys in annotations:
+- `nodes.example.com/managed-labels` — JSON array of label keys
+- `nodes.example.com/managed-taints` — JSON array of `key:effect`
+- `nodes.example.com/claimed-by` — winning NodePool name
+
+Reconcile: drop managed keys that left the spec → upsert spec keys → rewrite annotations. Reserved prefixes and the bootstrap label are never managed. If a human sets a key that is in `spec.labels`, the pool wins on the next reconcile; otherwise foreign keys stay.
+
+| | Pros | Cons |
+| --- | --- | --- |
+| **Chosen: annotation allow-list** | Debuggable (`kubectl get node -o yaml`); works with strategic-merge clients; survives `kubectl edit`; clear delete set on spec shrink | Annotation can be deleted by a human → ownership “forgotten” until next apply rebuilds it; not native field-manager semantics |
+| **Alt: SSA / field managers** | First-class ownership in apiserver | Most Node writers still use SMP; Force fights kubelet keys; non-Force can stick in conflicts |
+| **Alt: hash of desired labels** | Cheap drift detection | Does not say *which* keys to delete without also storing a key list |
+
+### ADR-2 — Membership: bootstrap label + claimed-by (no ownerRefs)
+
+**Context.** Infra joins nodes with `nodes.example.com/nodepool=<name>`. Deleting a NodePool must not GC live Nodes (VMs belong to infra).
+
+**Decision.** Watch NodePool + Node. Map Node → pool via bootstrap label **or** `claimed-by`. List members by label selector, then merge names still in `status.nodes` if still labeled/claimed. Cluster-scoped CRD (Nodes are cluster-scoped).
+
+| | Pros | Cons |
+| --- | --- | --- |
+| **Chosen: label + claim annotation** | Explicit join signal from infra; claim prevents two pools fighting; delete pool does not delete Nodes | Two fields to keep consistent; claim can race under dual-write (first writer wins) |
+| **Alt: ownerReferences** | Automatic GC / adopt semantics | Deleting NodePool would GC Nodes — wrong ownership model |
+| **Alt: status-only inventory** | Single source of truth on the CR | Join would require an API call into this controller; infra already stamps labels |
+
+### ADR-3 — Grace / drain clocks in NodePool status (not memory)
+
+**Context.** Controller can restart mid–NotReady or mid-drain. Assignment forbids `time.Sleep` in reconcile.
+
+**Decision.** Persist `status.nodes[].notReadySince` and `drainStartedAt`. Fallback if status empty: Node Ready `lastTransitionTime`, then `now`. Wait with `RequeueAfter` (controller-runtime workqueue), never sleep.
+
+| | Pros | Cons |
+| --- | --- | --- |
+| **Chosen: status timestamps + RequeueAfter** | Survives crash / leader election; level-triggered; no lost in-memory timers | Extra status writes; clock skew vs Node condition time if status never landed |
+| **Alt: in-memory timer** | Simple | Lost on restart → grace can restart (delayed removals) or appear expired early |
+| **Alt: only Node condition LastTransitionTime** | No status field | Condition can flap / get patched in demos; weaker control of “our” clock |
+
+### ADR-4 — Ready=False and Ready=Unknown share the state machine
+
+**Context.** Both mean the member is not a working Ready node. Force-deleting pods is dangerous when kubelet may still be alive.
+
+**Decision.** Same phases (`NotReady` → drain → remove). Operational difference only for optional force-delete: allowed solely when Ready=`Unknown` and `forceDeletePodsAfterDrainTimeout=true`. Default is **do not** force-delete; delete the Node and let pod GC finish.
+
+| | Pros | Cons |
+| --- | --- | --- |
+| **Chosen: one FSM, gated force-delete** | Simple operator model; avoids volume/unmount races on False | Unknown can also be a partition (false positive for “kubelet dead”) |
+| **Alt: separate policies per Ready status** | More precise | Spec/API complexity; easy to misconfigure |
+| **Alt: always force-delete after drain timeout** | Faster cleanup | Orphan writes, stuck VolumeAttachments, split-brain if node was only partitioned |
+
+### ADR-5 — Drain via Eviction API; delete Node object (compose with NLC)
+
+**Context.** `node-lifecycle-controller` already taints unreachable/not-ready and the taint manager evicts. This controller must add pool policy, concurrency, and inventory cleanup.
+
+**Decision.** After grace + `action: Remove`: cordon → `pods/eviction` (skip DaemonSet/mirror/terminating; PDB 429 → requeue) → delete **Node**. Cap concurrent `Draining`/`Removing` with `maxConcurrentRemovals`. Do not reimplement NLC; do not fight NoExecute.
+
+| | Pros | Cons |
+| --- | --- | --- |
+| **Chosen: eviction + Node delete + concurrency cap** | Honors PDBs; brownout-safe; control plane matches infra reclaim; clear Events/conditions | Not full `kubectl drain` (no volume-detach wait); overlaps somewhat with NLC eviction |
+| **Alt: only rely on NLC** | Less code | No pool-scoped grace, no max concurrent removals, Nodes linger forever |
+| **Alt: directly delete pods** | Faster | Ignores PDBs; riskier than eviction |
+
+### ADR-6 — Finalizer cleanup strips labels; never deletes Nodes on pool delete
+
+**Context.** Spec requires cleaning labels/taints this controller applied, then removing the pool.
+
+**Decision.** Finalizer `nodes.example.com/nodepool`. On delete: uncordon Ready members we cordoned → `StripManaged` → remove finalizer. Bootstrap label left for infra.
+
+| | Pros | Cons |
+| --- | --- | --- |
+| **Chosen: strip + finalizer** | Safe teardown; Ready members get schedulable again if we cordoned; no accidental VM/Node wipe | Stuck finalizer if Node updates keep failing; NotReady members still get claim stripped |
+| **Alt: delete all member Nodes on pool delete** | Clean inventory | Wrong: infra owns VMs; blows up workloads |
+
+### ADR-7 — Level-triggered reconcile (controller-runtime workqueue)
+
+**Context.** Joins, status flaps, and grace timers all need retries without sleeping in-process.
+
+**Decision.** Watches + `ctrl.Result{RequeueAfter}` / `{Requeue: true}` / errors. Workqueue owns retries and rate limiting.
+
+| | Pros | Cons |
+| --- | --- | --- |
+| **Chosen: level-triggered + workqueue** | Idempotent; crash-safe; matches Kubernetes controller norms | Multiple reconciles per event; must tolerate stale reads / conflict retries |
+| **Alt: edge-triggered + sleep** | Fewer reconciles | Violates assignment; timers die with the process |
+
+### Decision summary
+
+| Area | Chose | Rejected |
+| --- | --- | --- |
+| Ownership | Managed-key annotations + claim | SSA, hash-only |
+| Membership | Bootstrap label + status merge | ownerRefs |
+| Timers | Status fields + RequeueAfter | In-memory, Sleep |
+| Unready | Shared FSM; force-delete opt-in for Unknown | Separate policies / always force |
+| Drain | Eviction API → delete Node | NLC-only or raw pod delete |
+| Pool delete | Finalizer strip | Delete member Nodes |
+
+## Design decisions (Q&A from the assignment)
 
 ### 1. Label/taint ownership
 
-**Choice: annotation of managed keys**, not SSA.
-
-- `nodes.example.com/managed-labels`: JSON array of keys we last applied from `spec.labels`
-- `nodes.example.com/managed-taints`: JSON array of `key:effect`
-- `nodes.example.com/claimed-by`: NodePool name that won the race
-
-On reconcile we (1) delete keys listed as managed that are no longer in spec, (2) upsert spec keys, (3) rewrite the annotation to the new set. Keys we never listed stay put (`human=keep-me`, `kubernetes.io/hostname`, `node.kubernetes.io/unreachable`, …). Reserved prefixes (`kubernetes.io/`, `k8s.io/`, `node.kubernetes.io/`, …) and the bootstrap label are never managed.
-
-**Human sets a matching label:** if the key is in `spec.labels`, the pool spec is source of truth — we overwrite on the next reconcile. If the key is *not* in spec and not in the managed annotation, we leave it. That is the contract operators already have with other controllers (CNI, CCM).
-
-**Why not SSA / field managers?** Node is the most contended object in the cluster. kubelet, CCM, and `kubectl label` mostly use strategic-merge patch, not SSA. SSA `Force` on labels would still fight kubelet-owned keys; SSA without Force would leave the object stuck in conflict. An explicit allow-list is debuggable (`kubectl get node -o yaml` shows exactly what we think we own) and survives `kubectl edit`. Cost: we cannot recover ownership if someone deletes the annotation; the next reconcile re-applies spec keys and rebuilds it.
-
-**Why not a hash annotation?** A hash tells you “spec drifted” but not *which* keys to delete. You still need a key list.
+See [ADR-1](#adr-1--labeltaint-ownership-managed-key-annotations-not-ssa).
 
 ### 2. Reconciliation triggers
 
-Watches:
-
-1. `NodePool` (primary)
-2. `Node`, mapped to a pool by **bootstrap label** `nodes.example.com/nodepool` **or** `claimed-by` annotation
-
-Membership listing: `List` with label selector `nodes.example.com/nodepool=<pool>` plus `Get` of names still in `status.nodes` (covers a node that lost the bootstrap label but is still claimed). We do **not** use owner references: deleting a NodePool must not GC Node objects — the VM is owned by infra.
-
-Cluster-scoped CRD: Nodes are cluster-scoped; a namespaced NodePool would be a lie.
+See [ADR-2](#adr-2--membership-bootstrap-label--claimed-by-no-ownerrefs). Watches: NodePool (primary); Node mapped by bootstrap label or `claimed-by`.
 
 ### 3. Grace-period clock
 
-Persisted on **`status.nodes[].notReadySince`**. That survives leader election and process restart.
-
-If status is empty (crash before the first status write), we fall back to the Node Ready condition’s `lastTransitionTime`, then to `now`. We do **not** keep the timer only in memory.
-
-`status.nodes[].drainStartedAt` is the same idea for drain timeout.
+See [ADR-3](#adr-3--grace--drain-clocks-in-nodepool-status-not-memory).
 
 ### 4. Ready=False vs Ready=Unknown
 
-**Same state machine.** Both mean “this member is not a working Ready node.”
-
-They are not the same *operationally*:
-
-| | Typical cause | kubelet | Force-delete pods? |
-| --- | --- | --- | --- |
-| **Unknown** | missed heartbeats / VM gone | likely dead | only if `forceDeletePodsAfterDrainTimeout=true` |
-| **False** | kubelet reported NotReady (disk, PID, …) | alive | **never** — kubelet may still be writing volumes |
-
-Default is `forceDeletePodsAfterDrainTimeout: false`. After drain timeout we delete the **Node** object and let kube-controller-manager’s pod GC finish. That is the kubelet-is-gone path without racing a live kubelet.
+See [ADR-4](#adr-4--readyfalse-and-readyunknown-share-the-state-machine).
 
 ### 5. Force-delete safety
 
-Eviction API first (honors PDBs; 429 → requeue). Skip DaemonSets, mirror pods, already-terminating pods.
-
-**Default after drain timeout: do not force-delete pods.** Risk of force-delete: orphaned writes, unmount races, stuck VolumeAttachments, split-brain if the node was only partitioned.
-
-Guardrails if the flag is enabled: only when Ready=**Unknown**; grace period 0; still bounded by `maxConcurrentRemovals`.
+See [ADR-4](#adr-4--readyfalse-and-readyunknown-share-the-state-machine) and [ADR-5](#adr-5--drain-via-eviction-api-delete-node-object-compose-with-nlc). Default off; if on, only Unknown + grace 0 + concurrency cap.
 
 ### 6. Failure modes (crash mid-removal)
 
@@ -129,37 +327,21 @@ Everything that matters is in the API server:
 
 | Crash during | Resume |
 | --- | --- |
-| After cordon, before eviction | Node unschedulable + `cordoned=true` annotation; next reconcile continues drain |
-| After some evictions | Level trigger: remaining evictable pods are evicted again (idempotent) |
-| After Node delete, before status | Next reconcile `Get` → NotFound → drop member, emit `NodeRemoved` |
+| After cordon, before eviction | Node unschedulable + `cordoned=true`; next reconcile continues drain |
+| After some evictions | Level trigger re-evicts remaining pods |
+| After Node delete, before status | `Get` → NotFound → drop member, `NodeRemoved` |
 | After finalizer add, before labels | Next reconcile applies labels |
 | Mid pool delete | Finalizer remains until strip succeeds |
 
-No in-memory work queue that can be lost.
-
 ### 7. Concurrency / two pools, one node
 
-A Node has one value for `nodes.example.com/nodepool`. First reconciler to write `claimed-by` wins. If another pool sees a foreign claim, it **does not steal**: Warning event `MembershipConflict`, `Failed=True` on that pool, skip the node.
-
-If infra moves the bootstrap label to another pool, the old pool **releases** (strip managed keys + claim) so the new pool can attach.
-
-We never set ownerRefs that would cause cross-GC.
+First writer of `claimed-by` wins. Foreign claim → `MembershipConflict`, skip (no steal). Bootstrap label move → old pool releases managed keys so the new pool can attach.
 
 ### 8. Composition with kube-controller-manager
 
-`node-lifecycle-controller` already taints `node.kubernetes.io/unreachable:NoExecute` (and `not-ready`) and the taint manager evicts.
+See [ADR-5](#adr-5--drain-via-eviction-api-delete-node-object-compose-with-nlc). This controller adds pool labels/taints, grace policy, concurrency cap, Node deletion, and status/events on top of NLC’s unreachable taints.
 
-This controller adds **pool identity and inventory**:
-
-- Desired labels/taints from the NodePool spec (GPU NoSchedule, etc.)
-- A **grace policy** that is a NodePool decision, not a cluster-wide kube-controller-manager flag
-- **Concurrency cap** so a brownout does not delete the whole pool
-- **Deletion of the Node object** so the control plane matches infra reclaim (NLC does not delete Nodes by default)
-- Pool-level status, conditions, and events for operators
-
-We skip DaemonSet pods on drain the same way `kubectl drain` does; we do not fight NoExecute eviction — if pods are already terminating, drain is a wait.
-
-Inspiration (not copied): Cluster API MachineDrain rules, Karpenter disruption budgets, `kubectl drain` skip logic. None of those operators are used here.
+Inspiration (not used): Cluster API MachineDrain, Karpenter disruption budgets, `kubectl drain` skip logic.
 
 ## Observability
 
