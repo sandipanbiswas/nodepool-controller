@@ -165,7 +165,7 @@ sequenceDiagram
 
 ## Build & run locally
 
-Prerequisites: Go 1.26+, Docker, kubectl, [kind](https://kind.sigs.k8s.io/).
+Prerequisites: Go 1.26+, Docker, kubectl, [kind](https://kind.sigs.k8s.io/). On macOS, see [Troubleshooting local setup](#troubleshooting-local-setup-macos) if `kind` or the Go link step fails.
 
 ```bash
 # Unit + envtest (no cluster)
@@ -192,6 +192,117 @@ kubectl apply -f config/samples/nodes_v1alpha1_nodepool.yaml
 # Simulate join (real or synthetic node):
 kubectl label node <name> nodes.example.com/nodepool=gpu-pool
 ```
+
+### Troubleshooting local setup (macOS)
+
+**`kind create cluster` fails with `Sign in to continue using Docker Desktop`.** Docker Desktop is enforcing org sign-in (`registry.json`); kind cannot list containers until it is satisfied. Sign in to Docker Desktop with the org account (or `docker login`), wait for "Engine running", confirm with `docker ps`, then rerun `kind create cluster --name nodepool-demo`.
+
+**`make install` / `make run` fail at link time with `tapi error: malformed file ... unknown architecture arm64e.x1-macos`.** The default SDK (`MacOSX27.0.sdk`) is newer than the Command Line Tools linker (`ld-1267`, CLT 26.6), so any cgo-linked Go binary (`bin/kustomize`, `cmd/main.go`) fails. Point the build at an SDK the linker understands:
+
+```bash
+ls /Library/Developer/CommandLineTools/SDKs/          # pick an installed 26.x SDK
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+make install
+make run
+```
+
+Permanent fix: update Command Line Tools so the linker matches the SDK (Software Update, or `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install`), then drop `SDKROOT`.
+
+### Demo output
+
+`./hack/demo.sh` against a kind cluster (NodePool `metadata` trimmed):
+
+```text
+==> Install CRDs
+customresourcedefinition.apiextensions.k8s.io/nodepools.nodes.example.com unchanged
+==> Start controller in-process (make run) if one is not already deployed
+No in-cluster controller found; starting 'make run' in the background.
+Set SKIP_RUN=1 if you already have 'make run' in another terminal.
+==> Create NodePool
+nodepool.nodes.example.com/gpu-pool created
+==> Simulate infra join: create a synthetic Node and stamp the bootstrap label
+node/demo-gpu-node created
+==> Wait for labels/taints
+NAME            STATUS   ROLES    AGE   VERSION   LABELS
+demo-gpu-node   Ready    <none>   0s              kubernetes.io/hostname=demo-gpu-node,nodes.example.com/nodepool=gpu-pool,tier=premium,workload=gpu
+[{"effect":"NoSchedule","key":"nvidia.com/gpu","value":"true"}]
+apiVersion: nodes.example.com/v1alpha1
+kind: NodePool
+metadata:
+  finalizers:
+  - nodes.example.com/nodepool
+  generation: 2
+  name: gpu-pool
+spec:
+  image: ubuntu-22.04-gpu
+  labels:
+    tier: premium
+    workload: gpu
+  taints:
+  - effect: NoSchedule
+    key: nvidia.com/gpu
+    value: "true"
+  unreadyPolicy:
+    action: Remove
+    drainTimeout: 5m0s
+    gracePeriod: 5m0s
+    maxConcurrentRemovals: 1
+status:
+  conditions:
+  - message: 1/1 members Ready
+    observedGeneration: 2
+    reason: MembersReady
+    status: "True"
+    type: Ready
+  - message: no in-flight removals
+    observedGeneration: 2
+    reason: Idle
+    status: "False"
+    type: Progressing
+  - message: ""
+    observedGeneration: 2
+    reason: NoError
+    status: "False"
+    type: Failed
+  nodes:
+  - name: demo-gpu-node
+    phase: Ready
+  observedGeneration: 2
+  readyNodes: 1
+==> Simulate infra reclaim: Ready=Unknown (kubelet gone)
+node/demo-gpu-node patched
+==> Temporarily shorten grace? Sample uses 5m. For demo, patch gracePeriod to 5s.
+nodepool.nodes.example.com/gpu-pool patched
+==> Wait for controller to delete the Node
+[{"name":"demo-gpu-node","notReadySince":"2026-10-08T06:27:41Z","phase":"NotReady"}]
+[{"name":"demo-gpu-node","notReadySince":"2026-10-08T06:27:41Z","phase":"NotReady"}]
+[{"name":"demo-gpu-node","notReadySince":"2026-10-08T06:27:41Z","phase":"NotReady"}]
+[{"name":"demo-gpu-node","notReadySince":"2026-10-08T06:27:41Z","phase":"NotReady"}]
+Node demo-gpu-node removed
+==> Recreate a Ready member then delete the pool (label cleanup)
+node/demo-gpu-node created
+nodepool.nodes.example.com "gpu-pool" deleted
+Remaining labels on demo-gpu-node:
+NAME            STATUS   ROLES    AGE   VERSION   LABELS
+demo-gpu-node   Ready    <none>   3s              human=keep-me,nodes.example.com/nodepool=gpu-pool
+node "demo-gpu-node" deleted
+==> Done. Events:
+LAST SEEN   TYPE      REASON         OBJECT              MESSAGE
+8s          Warning   NodeNotReady   nodepool/gpu-pool   node demo-gpu-node Ready=Unknown
+3s          Normal    NodeJoined     nodepool/gpu-pool   node demo-gpu-node joined pool
+3s          Normal    NodeDraining   nodepool/gpu-pool   draining node demo-gpu-node
+3s          Normal    NodeRemoving   nodepool/gpu-pool   deleting Node demo-gpu-node
+3s          Normal    NodeRemoved    nodepool/gpu-pool   node demo-gpu-node gone
+0s          Normal    PoolDeleting   nodepool/gpu-pool   stripping managed labels/taints from members
+```
+
+What it shows:
+
+- **Join** — pool labels (`tier`, `workload`) and the `nvidia.com/gpu` taint applied; status `1/1 members Ready`.
+- **Reclaim** — `Ready=Unknown` sets `notReadySince`; after the 5s grace the node is drained and the Node object deleted (`NodeDraining` → `NodeRemoving` → `NodeRemoved`).
+- **Pool delete** — finalizer strips only managed keys: the foreign `human=keep-me` label survives, and the infra-owned bootstrap label `nodes.example.com/nodepool` is intentionally left in place.
+
+The demo leaves `make run` in the background; stop it with `pkill -f cmd/main.go` when done.
 
 RBAC is generated from `+kubebuilder:rbac` markers (`config/rbac/role.yaml`): NodePool CRUD + status/finalizers, Node get/list/watch/update/patch/delete, Pod get/list/watch/delete, `pods/eviction` create, Event create/patch.
 
